@@ -229,7 +229,7 @@ steps:
       3. duration_sec = 该镜头覆盖的 SRT 时间段长度
       4. 所有 duration_sec 之和 = 音频总时长
       5. clips_needed = ceil(duration_sec / 10)，最少 1
-      6. prompt（英文 200-400 字符）必须包含：画面内容、构图、色调、氛围、镜头运动
+      6. prompt（ 200-400 汉字）必须包含：画面内容、构图、色调、氛围、镜头运动，所有画面保持同样风格
       7. negative_prompt 排除不想要的元素
       8. timestamp 格式 M:SS - M:SS，连续覆盖全部时长
       9. ID 从 S01 递增
@@ -312,7 +312,7 @@ steps:
         output_path = args["output_path"]
 
         burn_script = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(args["scripts_dir"]))),
+            os.path.abspath(args["scripts_dir"]),
             "burn_subs.py"
         )
 

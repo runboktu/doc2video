@@ -720,39 +720,151 @@ def generate_videos(project: dict, backend):
     generate_concat_file(project)
 
 
-def generate_concat_file(project: dict):
-    """生成 ffmpeg concat 需要的文件列表"""
+def generate_videos_ffmpeg(project: dict, skip_existing: bool = True):
+    """用 ffmpeg zoompan 将静态图片生成视频（慢速推近效果）
+
+    从 prompts.json 的 default_params 读取视频参数:
+      - resolution: "1080p" / "720p" / "480p"
+      - fps: 帧率
+      - aspect_ratio: "16:9" / "4:3" / "1:1"
+    """
+    import subprocess
+    import math
+
+    dp = project.get("default_params", {})
+    fps = dp.get("fps", 24)
+    aspect = dp.get("aspect_ratio", "16:9")
+
+    resolution_map = {
+        ("1080p", "16:9"): (1920, 1080),
+        ("1080p", "4:3"):  (1440, 1080),
+        ("720p",  "16:9"): (1280, 720),
+        ("720p",  "4:3"):  (960, 720),
+        ("480p",  "16:9"): (854, 480),
+        ("480p",  "4:3"):  (640, 480),
+    }
+    res_name = dp.get("resolution", "1080p")
+    width, height = resolution_map.get((res_name, aspect), (1920, 1080))
+
+    print(f"📹 ffmpeg 模式 | 分辨率: {width}x{height} | FPS: {fps} | 比例: {aspect}")
+
+    total = len(project["shots"])
+
+    for idx, shot in enumerate(project["shots"], 1):
+        shot_id = shot["id"]
+        duration = shot["duration_sec"]
+        total_frames = int(duration * fps)
+
+        image_path = IMAGES_DIR / f"{shot_id}.png"
+        output_path = CLIPS_DIR / f"{shot_id}.mp4"
+
+        print(f"\n{'─' * 50}")
+        print(f"  [{idx}/{total}] {shot_id} | {shot['timestamp']} | {duration:.1f}s ({total_frames} frames)")
+
+        if not image_path.exists():
+            alt_path = IMAGES_DIR / f"{shot_id}_keyframe.png"
+            if alt_path.exists():
+                image_path = alt_path
+            else:
+                print(f"  ⚠️  缺少图片: {image_path.name}，跳过")
+                continue
+
+        if skip_existing and output_path.exists():
+            size_mb = output_path.stat().st_size / 1024 / 1024
+            print(f"  ⏭️  跳过已有: {output_path.name} ({size_mb:.1f}MB)")
+            continue
+
+        # scale 到 2x 目标分辨率（crop 居中裁切），zoompan 操作后再 scale 回来
+        # 2x 分辨率让 zoompan 整数取整误差 < 0.5 物理像素，消除抖动
+        max_zoom = 1.2
+        zoom_speed = (max_zoom - 1.0) / total_frames if total_frames > 0 else 0.001
+        iw, ih = width * 2, height * 2
+        vf = (
+            f"scale={iw}:{ih}:force_original_aspect_ratio=increase,"
+            f"crop={iw}:{ih},"
+            f"zoompan=z='min(zoom+{zoom_speed:.6f},{max_zoom})'"
+            f":x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2'"
+            f":d={total_frames}:s={iw}x{ih}:fps={fps},"
+            f"scale={width}:{height}"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-i", str(image_path),
+            "-vf", vf,
+            "-t", str(duration),
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            str(output_path),
+        ]
+
+        print(f"  🎬 生成中...")
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=300
+        )
+
+        if result.returncode != 0:
+            print(f"  ❌ ffmpeg 失败:")
+            print(f"     {result.stderr[-300:]}")
+            continue
+
+        size_mb = output_path.stat().st_size / 1024 / 1024
+        print(f"  ✅ {output_path.name} ({size_mb:.1f}MB)")
+
+    print(f"\n\n🎬 ffmpeg 视频生成完成！保存在: {CLIPS_DIR}/")
+    generate_concat_file(project, mode="ffmpeg")
+
+
+def generate_concat_file(project: dict, mode: str = "api"):
+    """生成 ffmpeg concat 需要的文件列表
+
+    mode="api":    按 clips_needed 拆分 (S01_clip01.mp4, S01_clip02.mp4, ...)
+    mode="ffmpeg": 每个 shot 一个视频 (S01.mp4, S02.mp4, ...)
+    """
     concat_path = PROJECT_DIR / "concat_list.txt"
 
     with open(concat_path, "w", encoding="utf-8") as f:
         for shot in project["shots"]:
             shot_id = shot["id"]
-            clips_needed = shot["clips_needed"]
-            for clip_idx in range(clips_needed):
-                clip_name = f"{shot_id}_clip{clip_idx + 1:02d}.mp4"
-                clip_path = CLIPS_DIR / clip_name
+            if mode == "ffmpeg":
+                clip_path = CLIPS_DIR / f"{shot_id}.mp4"
                 if clip_path.exists():
                     f.write(f"file '{clip_path}'\n")
                 else:
-                    print(f"  ⚠️  缺少片段: {clip_name}")
+                    print(f"  ⚠️  缺少片段: {shot_id}.mp4")
+            else:
+                clips_needed = shot["clips_needed"]
+                for clip_idx in range(clips_needed):
+                    clip_name = f"{shot_id}_clip{clip_idx + 1:02d}.mp4"
+                    clip_path = CLIPS_DIR / clip_name
+                    if clip_path.exists():
+                        f.write(f"file '{clip_path}'\n")
+                    else:
+                        print(f"  ⚠️  缺少片段: {clip_name}")
 
     print(f"\n📝 ffmpeg concat 列表已生成: {concat_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="新铁屋记 — AI视频批量生成",
+        description="doc2video — AI视频批量生成",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 生成关键帧图片 + 视频片段（全流程）
+  # ffmpeg 模式：静态图推近生成视频（零成本，无需 API）
+  python generate_videos.py --mode ffmpeg
+
+  # 生成关键帧图片 + 视频片段（全流程，需 API）
   python generate_videos.py --mode all --backend kling
 
-  # 只生成视频片段（如果已有图片）
+  # 只生成视频片段（如果已有图片，需 API）
   python generate_videos.py --mode videos --backend kling
 
   # 只生成特定镜头
-  python generate_videos.py --mode videos --backend kling --shots S01 S02 S03
+  python generate_videos.py --mode ffmpeg --shots S01 S02 S03
 
   # 使用 Runway
   python generate_videos.py --mode all --backend runway
@@ -760,46 +872,57 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["images", "videos", "all"],
+        choices=["images", "videos", "ffmpeg", "all"],
         default="all",
-        help="生成模式: images(只生成图片), videos(只生成视频), all(全流程)",
+        help="生成模式: images(只生成图片), videos(API视频), ffmpeg(本地推近), all(图片+API视频)",
     )
     parser.add_argument(
         "--backend",
         choices=list(BACKENDS.keys()),
         default="kling",
-        help="API 后端",
+        help="API 后端 (ffmpeg 模式忽略此参数)",
     )
     parser.add_argument(
         "--shots",
         nargs="*",
         help="只生成指定镜头，如: --shots S01 S05 S14",
     )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        default=True,
+        help="跳过已存在的视频文件 (默认开启)",
+    )
 
     args = parser.parse_args()
 
     project = load_prompts()
 
-    # 过滤指定镜头
     if args.shots:
         project["shots"] = [s for s in project["shots"] if s["id"] in args.shots]
         print(f"🎯 指定镜头: {args.shots}")
 
+    dp = project.get("default_params", {})
     print(f"{'=' * 60}")
-    print(f"新铁屋记 — AI视频批量生成")
+    print(f"doc2video — 视频批量生成")
+    print(f"项目: {project.get('project', 'N/A')}")
     print(f"镜头数: {len(project['shots'])}")
-    print(f"总片段数: {sum(s['clips_needed'] for s in project['shots'])}")
     print(f"模式: {args.mode}")
-    print(f"后端: {args.backend}")
+    if args.mode != "ffmpeg":
+        print(f"后端: {args.backend}")
+    print(f"参数: {dp.get('resolution', 'N/A')} / {dp.get('fps', 'N/A')}fps / {dp.get('aspect_ratio', 'N/A')}")
     print(f"{'=' * 60}\n")
 
-    backend = BACKENDS[args.backend]()
+    if args.mode == "ffmpeg":
+        generate_videos_ffmpeg(project, skip_existing=args.skip_existing)
+    else:
+        backend = BACKENDS[args.backend]()
 
-    if args.mode in ("images", "all"):
-        generate_images(project, backend)
+        if args.mode in ("images", "all"):
+            generate_images(project, backend)
 
-    if args.mode in ("videos", "all"):
-        generate_videos(project, backend)
+        if args.mode in ("videos", "all"):
+            generate_videos(project, backend)
 
     print("\n✅ 完成！下一步:")
     print("   bash assemble.sh  # 拼接视频 + 叠加音频")
