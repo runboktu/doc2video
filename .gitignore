@@ -1,0 +1,7 @@
+# Media files
+*.mp3
+*.wav
+*.mp4
+
+# OS
+.DS_Store

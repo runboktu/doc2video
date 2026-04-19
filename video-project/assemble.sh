@@ -11,12 +11,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 CLIPS_DIR="$SCRIPT_DIR/clips"
-AUDIO_FILE="$PROJECT_DIR/xin-tie-wu-man-0.9x.wav"
+AUDIO_FILE="$PROJECT_DIR/月夜-赏析.wav"
 
 CONCAT_LIST="$SCRIPT_DIR/concat_list.txt"
 MERGED_RAW="$SCRIPT_DIR/merged_raw.mp4"
 MERGED_NORMALIZED="$SCRIPT_DIR/merged_normalized.mp4"
-FINAL_OUTPUT="$PROJECT_DIR/新铁屋记.mp4"
+FINAL_OUTPUT="$PROJECT_DIR/月夜-赏析.mp4"
 
 SKIP_NORMALIZE=false
 AUDIO_ONLY=false

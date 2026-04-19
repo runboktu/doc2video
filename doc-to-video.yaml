@@ -219,8 +219,8 @@ steps:
 
       ## 输出格式（严格遵守）
       最终输出以下格式：
-
-      <final_answer>{"project":"...","total_duration_sec":...,"style_guide":"...","default_params":{"model_id":"qwen","resolution":"1080p","duration":5,"fps":24,"aspect_ratio":"16:9"},"shots":[{"id":"S01","timestamp":"0:00 - 0:30","duration_sec":30,"clips_needed":3,"prompt":"English visual description","negative_prompt":"elements to exclude"}]}</final_answer>
+      final_answer xml标签包裹如下json
+      {"project":"...","total_duration_sec":...,"style_guide":"...","default_params":{"model_id":"qwen","resolution":"1080p","duration":5,"fps":24,"aspect_ratio":"16:9"},"shots":[{"id":"S01","timestamp":"0:00 - 0:30","duration_sec":30,"clips_needed":3,"prompt":"English visual description","negative_prompt":"elements to exclude"}]}
 
       ## 分镜规则
 
@@ -243,7 +243,6 @@ steps:
       | modern | 现代扁平矢量，冷色调，几何构图，科技感 |
       | sketch | 铅笔素描质感，棕褐色调，手绘感，复古 |
 
-      再次强调：只输出 <final_answer>{JSON}</final_answer>，不要输出其他任何内容。
     agent_max_iterations: 10
 
   - id: write_prompts
