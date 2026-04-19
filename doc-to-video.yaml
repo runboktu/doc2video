@@ -1,0 +1,350 @@
+# ═══════════════════════════════════════════════════════════════
+# 文档到视频生成工作流
+#
+# DAG 执行图：
+#
+#   setup ──┬──→ tts ──┬──→ proofread_srt ──→ write_srt ──────────────────────────────────────────────┐
+#           │          │                                                                       │
+#           │          └──→ get_duration ──→ generate_prompts ──→ write_prompts ──→ gen_images ──┐    │
+#           │                                                                                    │    │
+#           └──→ read_md ──────────────────────────────────────┘──────────────────────────────────┘    │
+#                                                                                                       │
+#                                                                 burn_subs ←──────────────────────────┘
+#
+# 并行分支：
+#   - get_duration / proofread_srt 可并行（都依赖 tts）
+#   - gen_images 与 proofread_srt 可并行（互不依赖）
+#
+# 运行：
+#   DASHSCOPE_API_KEY=sk-xxx flow-run doc-to-video.yaml run \
+#     --input markdown_file=/path/to/article.md
+# ═══════════════════════════════════════════════════════════════
+
+name: "文档到视频生成"
+description: "Markdown文章 → TTS音频 → 分镜头脚本 → AI生图 → 视频合成 → 字幕烧录"
+version: "2.0.0"
+
+inputs:
+  - name: markdown_file
+    type: string
+    required: true
+    description: "输入的 Markdown 文章路径"
+
+  - name: work_dir
+    type: string
+    required: false
+    default: ""
+    description: "工作目录（默认取 markdown 文件所在目录）"
+
+  - name: scripts_dir
+    type: string
+    required: false
+    default: ""
+    description: "脚本目录（generate_images.py, assemble.sh 所在目录）"
+
+  - name: voice
+    type: string
+    required: false
+    default: "zh-CN-YunyangNeural"
+    description: "edge-tts 语音名称（如 zh-TW-YunyangNeural, zh-CN-YunyangNeural）"
+
+  - name: rate
+    type: string
+    required: false
+    default: "-10%"
+    description: "edge-tts 语速调整（如 -10% 降速，+20% 加速）"
+
+  - name: pitch
+    type: string
+    required: false
+    default: "-2Hz"
+    description: "edge-tts 音高调整（如 -2Hz 降调，+5Hz 升调）"
+
+  - name: max_shots
+    type: string
+    required: false
+    default: "20"
+    description: "分镜头最大数量"
+
+  - name: style
+    type: string
+    required: false
+    default: "ink_wash"
+    description: "视觉风格: ink_wash(水墨) / modern(现代) / sketch(素描)"
+
+  - name: dashscope_api_key
+    type: string
+    required: true
+    description: "阿里云百炼 API Key（千问生图）"
+
+config:
+  timeout: "60m"
+  on_failure: pause
+  max_concurrent: 4
+
+tools:
+  - name: read_file
+    description: "读取文件内容"
+    json_schema: |
+      {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+    source: builtin
+
+  - name: write_file
+    description: "写入文件"
+    json_schema: |
+      {"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}
+    source: builtin
+
+steps:
+  # ═══════════════════════════════════════════
+  # Phase 1: 初始化
+  # ═══════════════════════════════════════════
+
+  - id: setup
+    name: "初始化工作目录"
+    type: tool
+    tool:
+      name: setup_workdir
+      description: "创建目录结构，推导所有文件路径"
+      source: python
+      timeout_secs: 10
+      script: |
+        import json, os, sys
+        args = json.loads(sys.argv[1])
+        md = os.path.abspath(args["markdown_file"])
+        work = args["work_dir"] or os.path.dirname(md)
+        scripts = args["scripts_dir"] or os.path.join(work, "video-project")
+        base = os.path.splitext(os.path.basename(md))[0]
+        vdir = os.path.join(work, "video-project")
+        for d in ["images", "clips", "clips/normalized"]:
+            os.makedirs(os.path.join(vdir, d), exist_ok=True)
+        print(json.dumps({
+            "work_dir": work,
+            "scripts_dir": scripts,
+            "video_dir": vdir,
+            "base_name": base,
+            "md_path": md,
+            "audio_path": os.path.join(work, base + ".wav"),
+            "srt_path": os.path.join(work, base + ".srt"),
+            "srt_final": os.path.join(work, base + "-final.srt"),
+            "video_out": os.path.join(work, base + ".mp4"),
+            "final_out": os.path.join(work, base + "-字幕版.mp4"),
+            "prompts_file": os.path.join(vdir, "prompts.json")
+        }, ensure_ascii=False))
+    tool_args: |
+      {
+        "markdown_file": ${{ inputs.markdown_file | to_json }},
+        "work_dir": ${{ inputs.work_dir | to_json }},
+        "scripts_dir": ${{ inputs.scripts_dir | to_json }}
+      }
+
+  # ═══════════════════════════════════════════
+  # Phase 2: 语音合成 + 字幕生成
+  # ═══════════════════════════════════════════
+
+  - id: tts
+    name: "文档转语音 (edge-tts)"
+    type: shell
+    depends_on: [setup]
+    run: |
+      AUDIO=${{ steps.setup.audio_path }}
+      SRT=${{ steps.setup.srt_path }}
+      if [ -f "$AUDIO" ] && [ -f "$SRT" ]; then
+        echo "跳过 TTS: 音频和字幕已存在"
+        echo "  音频: $AUDIO ($(du -h "$AUDIO" | cut -f1))"
+        echo "  字幕: $SRT ($(wc -l < "$SRT") 行)"
+      else
+        edge-tts \
+          --voice ${{ inputs.voice }} \
+          --rate="${{ inputs.rate }}" \
+          --pitch="${{ inputs.pitch }}" \
+          --file ${{ steps.setup.md_path }} \
+          --write-media "$AUDIO" \
+          --write-subtitles "$SRT"
+          echo "TTS 完成: $AUDIO"
+      fi
+
+  # ═══════════════════════════════════════════
+  # Phase 3: 分镜头脚本生成 (并行分支起点)
+  # ═══════════════════════════════════════════
+
+  - id: get_duration
+    name: "获取音频时长"
+    type: shell
+    depends_on: [tts]
+    run: |
+      DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 ${{ steps.setup.audio_path }})
+      echo "$DURATION"
+
+  - id: read_md
+    name: "读取原文内容"
+    type: tool
+    depends_on: [setup]
+    tool_name: read_file
+    tool_args: '{"path": "${{ steps.setup.md_path }}"}'
+
+  - id: generate_prompts
+    name: "AI 生成分镜头脚本"
+    type: agent
+    agent_stream: true
+    depends_on: [get_duration, read_md, read_srt]
+    agent_input: |
+      ## 原始文章
+
+      ${{ steps.read_md }}
+
+      ## 音频总时长
+
+      ${{ steps.get_duration.stdout }} 秒
+
+      ## SRT 字幕文件（含精确时间戳和文本段落）
+
+      ${{ steps.read_srt }}
+
+      ## 视觉风格参数
+
+      ${{ inputs.style }}
+
+      ## 分镜头数量限制
+
+      最多 ${{ inputs.max_shots }} 个镜头。
+
+      请根据以上信息生成分镜头脚本 JSON。直接输出 JSON，不要任何解释。
+    agent_system_prompt: |
+      你必须直接输出结果。
+
+      ## 任务
+
+      根据中文文章内容、SRT 字幕时间戳和视觉风格，生成 prompts.json。
+
+      ## 输出格式（严格遵守）
+      最终输出以下格式：
+
+      <final_answer>{"project":"...","total_duration_sec":...,"style_guide":"...","default_params":{"model_id":"qwen","resolution":"1080p","duration":5,"fps":24,"aspect_ratio":"16:9"},"shots":[{"id":"S01","timestamp":"0:00 - 0:30","duration_sec":30,"clips_needed":3,"prompt":"English visual description","negative_prompt":"elements to exclude"}]}</final_answer>
+
+      ## 分镜规则
+
+      1. 以 SRT 的文本段落和时间戳为基础，合并语义相近的连续字幕为一个镜头
+      2. 每个镜头的 timestamp 必须与 SRT 中的时间戳对齐（取首条字幕的 start 和末条字幕的 end）
+      3. duration_sec = 该镜头覆盖的 SRT 时间段长度
+      4. 所有 duration_sec 之和 = 音频总时长
+      5. clips_needed = ceil(duration_sec / 10)，最少 1
+      6. prompt（英文 200-400 字符）必须包含：画面内容、构图、色调、氛围、镜头运动
+      7. negative_prompt 排除不想要的元素
+      8. timestamp 格式 M:SS - M:SS，连续覆盖全部时长
+      9. ID 从 S01 递增
+      10. shots 总数不得超过用户指定的 max_shots 限制，超出则合并语义最相近的相邻镜头
+
+      ## 风格映射
+
+      | style 参数 | 画风 |
+      |-----------|------|
+      | ink_wash | 黑白水墨/素描质感，冷灰暗蓝调色，偶有刺目鲜红，民国元素与现代交织 |
+      | modern | 现代扁平矢量，冷色调，几何构图，科技感 |
+      | sketch | 铅笔素描质感，棕褐色调，手绘感，复古 |
+
+      再次强调：只输出 <final_answer>{JSON}</final_answer>，不要输出其他任何内容。
+    agent_max_iterations: 10
+
+  - id: write_prompts
+    name: "写入 prompts.json"
+    type: tool
+    depends_on: [generate_prompts]
+    tool_name: write_file
+    tool_args: |
+      {
+        "path": "${{ steps.setup.prompts_file }}",
+        "content": ${{ steps.generate_prompts.answer | to_json }}
+      }
+
+  # ═══════════════════════════════════════════
+  # Phase 4: AI 生图
+  # ═══════════════════════════════════════════
+
+  - id: gen_images
+    name: "千问 AI 生图"
+    type: shell
+    depends_on: [write_prompts]
+    run: |
+      cd ${{ steps.setup.video_dir }}
+      DASHSCOPE_API_KEY=${{ inputs.dashscope_api_key }} \
+      python3 ${{ steps.setup.scripts_dir }}/generate_images.py --skip-existing
+    timeout: "30m"
+
+  # ═══════════════════════════════════════════
+  # Phase 5: 视频拼接
+  # ═══════════════════════════════════════════
+
+  - id: assemble
+    name: "视频拼接与音频叠加"
+    type: shell
+    depends_on: [gen_images]
+    run: |
+      cd ${{ steps.setup.video_dir }}
+      bash ${{ steps.setup.scripts_dir }}/assemble.sh --skip-normalize
+    timeout: "15m"
+
+  - id: read_srt
+    name: "读取 edge-tts SRT"
+    type: tool
+    depends_on: [tts]
+    tool_name: read_file
+    tool_args: '{"path": "${{ steps.setup.srt_path }}"}'
+
+  # ═══════════════════════════════════════════
+  # Phase 6: 字幕烧录 (汇聚点)
+  # ═══════════════════════════════════════════
+
+  - id: burn_subs
+    name: "烧录字幕到视频"
+    type: tool
+    depends_on: [assemble, tts]
+    tool:
+      name: burn_subtitles
+      description: "PIL 渲染字幕 + ffmpeg overlay 烧录"
+      source: python
+      timeout_secs: 600
+      script: |
+        import json, os, subprocess, sys
+
+        args = json.loads(sys.argv[1])
+        srt_path = args["srt_path"]
+        video_path = args["video_path"]
+        output_path = args["output_path"]
+
+        burn_script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(args["scripts_dir"]))),
+            "burn_subs.py"
+        )
+
+        if not os.path.exists(burn_script):
+            print(json.dumps({"error": f"burn_subs.py not found: {burn_script}"}))
+            sys.exit(1)
+
+        result = subprocess.run(
+            ["python3", burn_script, srt_path, video_path, output_path],
+            capture_output=True, text=True, timeout=540
+        )
+        if result.returncode != 0:
+            print(json.dumps({"error": result.stderr[-500:]}))
+            sys.exit(1)
+
+        size_mb = os.path.getsize(output_path) / 1024 / 1024
+        print(json.dumps({
+            "output_path": output_path,
+            "size_mb": round(size_mb, 1)
+        }))
+    tool_args: |
+      {
+        "srt_path": "${{ steps.setup.srt_path }}",
+        "video_path": "${{ steps.setup.video_out }}",
+        "output_path": "${{ steps.setup.final_out }}",
+        "scripts_dir": "${{ steps.setup.scripts_dir }}"
+      }
+
+outputs:
+  video_file: "${{ steps.setup.video_out }}"
+  final_video: "${{ steps.setup.final_out }}"
+  srt_file: "${{ steps.setup.srt_path }}"
+  prompts_file: "${{ steps.setup.prompts_file }}"
+  audio_file: "${{ steps.setup.audio_path }}"
