@@ -1,35 +1,48 @@
 #!/bin/bash
-# 新铁屋记 — 视频拼接 + 音频叠加脚本
+# 视频拼接 + 音频叠加脚本
 #
 # 用法:
-#   bash assemble.sh                  # 完整流程
-#   bash assemble.sh --skip-normalize # 跳过片段标准化（已标准化过）
-#   bash assemble.sh --audio-only     # 只叠加音频（已拼接好视频）
+#   bash assemble.sh --audio ../xxx.wav --output ../xxx.mp4              # 完整流程
+#   bash assemble.sh --audio ../xxx.wav --output ../xxx.mp4 --skip-normalize  # 跳过片段标准化
+#   bash assemble.sh --audio ../xxx.wav --output ../xxx.mp4 --audio-only     # 只叠加音频
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 CLIPS_DIR="$SCRIPT_DIR/clips"
-AUDIO_FILE="$PROJECT_DIR/月夜-赏析.wav"
 
 CONCAT_LIST="$SCRIPT_DIR/concat_list.txt"
 MERGED_RAW="$SCRIPT_DIR/merged_raw.mp4"
 MERGED_NORMALIZED="$SCRIPT_DIR/merged_normalized.mp4"
-FINAL_OUTPUT="$PROJECT_DIR/月夜-赏析.mp4"
 
 SKIP_NORMALIZE=false
 AUDIO_ONLY=false
+AUDIO_FILE=""
+FINAL_OUTPUT=""
 
 for arg in "$@"; do
-    case $arg in
+    case "$arg" in
         --skip-normalize) SKIP_NORMALIZE=true ;;
         --audio-only)     AUDIO_ONLY=true ;;
+        --audio=*)        AUDIO_FILE="${arg#*=}" ;;
+        --output=*)       FINAL_OUTPUT="${arg#*=}" ;;
     esac
 done
 
+if [ -z "$AUDIO_FILE" ]; then
+    echo "❌ 缺少 --audio 参数"
+    echo "   用法: bash assemble.sh --audio ../xxx.wav --output ../xxx.mp4"
+    exit 1
+fi
+if [ -z "$FINAL_OUTPUT" ]; then
+    echo "❌ 缺少 --output 参数"
+    echo "   用法: bash assemble.sh --audio ../xxx.wav --output ../xxx.mp4"
+    exit 1
+fi
+
 echo "============================================================"
-echo "新铁屋记 — 视频拼接与音频叠加"
+echo "视频拼接与音频叠加"
 echo "============================================================"
 
 # 检查依赖
@@ -48,6 +61,72 @@ fi
 
 AUDIO_DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$AUDIO_FILE")
 echo "🎵 音频时长: ${AUDIO_DURATION}s"
+
+# ──────────────────────────────────────────
+# Step 0: 图片转视频片段（Ken Burns 动效）
+# ──────────────────────────────────────────
+
+IMAGES_DIR="$SCRIPT_DIR/images"
+PROMPTS_FILE="$SCRIPT_DIR/prompts.json"
+
+mkdir -p "$CLIPS_DIR"
+
+if [ "$AUDIO_ONLY" = false ] && [ -f "$PROMPTS_FILE" ]; then
+    IMG_COUNT=$(find "$IMAGES_DIR" -name "*.png" 2>/dev/null | wc -l | tr -d ' ')
+
+    if [ "$IMG_COUNT" -gt 0 ]; then
+        echo ""
+        echo "🎞️  Step 0: 图片转视频片段 (${IMG_COUNT} 张图片)..."
+
+        SHOTS_TMP=$(mktemp)
+        python3 -c "
+import json
+with open('${PROMPTS_FILE}') as f:
+    data = json.load(f)
+for shot in data['shots']:
+    print(shot['id'] + '\t' + str(shot['duration_sec']))
+" > "$SHOTS_TMP"
+
+        I=0
+        while IFS=$'\t' read -r SHOT_ID DURATION; do
+            [ -z "$SHOT_ID" ] && continue
+            IMG="${IMAGES_DIR}/${SHOT_ID}.png"
+            CLIP="${CLIPS_DIR}/${SHOT_ID}.mp4"
+
+            if [ ! -f "$IMG" ]; then
+                echo "  ⚠️  缺少图片: ${SHOT_ID}.png，跳过"
+                I=$((I + 1))
+                continue
+            fi
+
+            if [ -f "$CLIP" ]; then
+                echo "  ⏭️  跳过已有: ${SHOT_ID}.mp4"
+                I=$((I + 1))
+                continue
+            fi
+
+            DIRECTIONS_X=("iw" "0" "iw*0.15" "0" "iw*0.15")
+            DIRECTIONS_Y=("ih" "0" "0" "ih*0.15" "ih*0.15")
+            DI=$((I % 5))
+            DX="${DIRECTIONS_X[$DI]}"
+            DY="${DIRECTIONS_Y[$DI]}"
+
+            FRAMES=$(python3 -c "print(int(float('${DURATION}') * 25))")
+            ZOOM_FILTER="scale=8000:-1,zoompan=z='min(zoom+0.0003,1.5)':x='${DX}':y='${DY}':d=${FRAMES}:s=1792x1024:fps=25"
+
+            echo "  🎞️  生成: ${SHOT_ID}.mp4 (${DURATION}s)"
+            ffmpeg -y -loop 1 -i "$IMG" -t "$DURATION" \
+                -vf "$ZOOM_FILTER" \
+                -c:v libx264 -preset medium -crf 23 \
+                -pix_fmt yuv420p -r 25 \
+                "$CLIP" </dev/null 2>/dev/null
+
+            I=$((I + 1))
+        done < "$SHOTS_TMP"
+        rm -f "$SHOTS_TMP"
+        echo "  ✅ 图片转视频完成"
+    fi
+fi
 
 # ──────────────────────────────────────────
 # Step 1: 统计可用片段
@@ -106,11 +185,18 @@ if [ "$AUDIO_ONLY" = false ]; then
     echo ""
     echo "🔗 Step 2/4: 拼接视频片段..."
 
-    # 用标准化后的片段生成 concat 列表
+    # 用标准化后的片段生成 concat 列表；若跳过标准化则用原始片段
     > "$CONCAT_LIST"
-    for clip in $(ls "$NORMALIZED_DIR"/*.mp4 2>/dev/null | sort); do
-        echo "file '$clip'" >> "$CONCAT_LIST"
-    done
+    if [ -d "$NORMALIZED_DIR" ] && [ "$(ls "$NORMALIZED_DIR"/*.mp4 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]; then
+        for clip in $(ls "$NORMALIZED_DIR"/*.mp4 2>/dev/null | sort); do
+            echo "file '$clip'" >> "$CONCAT_LIST"
+        done
+    else
+        echo "  ⚠️  无标准化片段，使用原始 clips/"
+        for clip in $(ls "$CLIPS_DIR"/*.mp4 2>/dev/null | sort); do
+            echo "file '$clip'" >> "$CONCAT_LIST"
+        done
+    fi
 
     CONCAT_COUNT=$(wc -l < "$CONCAT_LIST" | tr -d ' ')
     echo "  拼接 $CONCAT_COUNT 个片段"

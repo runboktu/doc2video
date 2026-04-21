@@ -239,7 +239,7 @@ steps:
 
       | style 参数 | 画风 |
       |-----------|------|
-      | ink_wash | 黑白水墨/素描质感，冷灰暗蓝调色，偶有刺目鲜红，民国元素与现代交织 |
+      | ink_wash | 黑白水墨/素描质感，冷灰暗蓝调色 |
       | modern | 现代扁平矢量，冷色调，几何构图，科技感 |
       | sketch | 铅笔素描质感，棕褐色调，手绘感，复古 |
 
@@ -280,7 +280,9 @@ steps:
     depends_on: [gen_images]
     run: |
       cd ${{ steps.setup.video_dir }}
-      bash ${{ steps.setup.scripts_dir }}/assemble.sh --skip-normalize
+      bash ${{ steps.setup.scripts_dir }}/assemble.sh --skip-normalize \
+        --audio=${{ steps.setup.audio_path }} \
+        --output=${{ steps.setup.video_out }}
     timeout: "15m"
 
   - id: read_srt
