@@ -15,7 +15,6 @@ OUTPUT_PATH = sys.argv[3] if len(sys.argv) > 3 else "新铁屋记-字幕版.mp4"
 
 FONT_PATH = "/System/Library/Fonts/STHeiti Light.ttc"
 FONT_SIZE = 50
-VIDEO_W, VIDEO_H = 1920, 1080
 MAX_CHARS_PER_LINE = 28
 MARGIN_BOTTOM = 80
 BG_PADDING = 12
@@ -112,6 +111,16 @@ def fmt_time(seconds):
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
+def get_video_resolution(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    parts = result.stdout.strip().split(",")
+    return int(parts[0]), int(parts[1])
+
+
 def main():
     project_dir = Path(__file__).parent if "__file__" in dir() else Path(".")
     srt_path = Path(SRT_PATH)
@@ -124,6 +133,9 @@ def main():
     if not output_path.is_absolute():
         output_path = project_dir / output_path
 
+    video_w, video_h = get_video_resolution(video_path)
+    print(f"视频分辨率: {video_w}x{video_h}")
+
     subs = parse_srt(str(srt_path))
     print(f"Parsed {len(subs)} subtitle entries")
 
@@ -134,7 +146,7 @@ def main():
 
     filter_parts = []
     for i, (start, end, text) in enumerate(subs):
-        img = render_subtitle(text, font, VIDEO_W, VIDEO_H)
+        img = render_subtitle(text, font, video_w, video_h)
         if img is None:
             continue
         png_path = os.path.join(tmpdir, f"sub_{i:04d}.png")

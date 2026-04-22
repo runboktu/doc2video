@@ -3,13 +3,13 @@
 #
 # DAG 执行图：
 #
-#   setup ──┬──→ tts ──┬──→ proofread_srt ──→ write_srt ──────────────────────────────────────────────┐
-#           │          │                                                                       │
-#           │          └──→ get_duration ──→ generate_prompts ──→ write_prompts ──→ gen_images ──┐    │
-#           │                                                                                    │    │
-#           └──→ read_md ──────────────────────────────────────┘──────────────────────────────────┘    │
-#                                                                                                       │
-#                                                                 burn_subs ←──────────────────────────┘
+#   setup ──→ clean_text ──┬──→ tts ──┬──→ proofread_srt ──→ write_srt ─────────────────────────────────────┐
+#                          │          │                                                                       │
+#                          │          └──→ get_duration ──→ generate_prompts ──→ write_prompts ──→ gen_images ┐
+#                          │                                                                                      │
+#                          └──→ read_md ────────────────────────────┘────────────────────────────────────────┘
+#                                                                                                             │
+#                                                                 burn_subs ←────────────────────────────────┘
 #
 # 并行分支：
 #   - get_duration / proofread_srt 可并行（都依赖 tts）
@@ -124,6 +124,7 @@ steps:
             "video_dir": vdir,
             "base_name": base,
             "md_path": md,
+            "cleaned_path": os.path.join(work, base + "-clean.txt"),
             "audio_path": os.path.join(work, base + ".wav"),
             "srt_path": os.path.join(work, base + ".srt"),
             "srt_final": os.path.join(work, base + "-final.srt"),
@@ -139,17 +140,37 @@ steps:
       }
 
   # ═══════════════════════════════════════════
+  # Phase 1.5: 清洗文本（删除 Markdown 语法，供 TTS 使用）
+  # ═══════════════════════════════════════════
+
+  - id: clean_text
+    name: "清洗文本用于 TTS"
+    type: shell
+    depends_on: [setup]
+    run: |
+      CLEANED=${{ steps.setup.cleaned_path }}
+      MD=${{ steps.setup.md_path }}
+      SCRIPTS=${{ steps.setup.scripts_dir }}
+      if [ -f "$CLEANED" ]; then
+        echo "跳过清洗: 已存在 $CLEANED"
+      else
+        python3 "$SCRIPTS/../clean_tts.py" "$MD" -o "$CLEANED"
+        echo "清洗完成: $CLEANED ($(wc -c < "$CLEANED") bytes)"
+      fi
+
+  # ═══════════════════════════════════════════
   # Phase 2: 语音合成 + 字幕生成
   # ═══════════════════════════════════════════
 
   - id: tts
     name: "文档转语音 (edge-tts)"
     type: shell
-    depends_on: [setup]
+    depends_on: [clean_text]
     run: |
       AUDIO=${{ steps.setup.audio_path }}
       SRT=${{ steps.setup.srt_path }}
-      if [ -f "$AUDIO" ] && [ -f "$SRT" ]; then
+      CLEANED=${{ steps.setup.cleaned_path }}
+      if [ -f "$AUDIO" ] && [ -s "$AUDIO" ] && [ -f "$SRT" ] && [ -s "$SRT" ]; then
         echo "跳过 TTS: 音频和字幕已存在"
         echo "  音频: $AUDIO ($(du -h "$AUDIO" | cut -f1))"
         echo "  字幕: $SRT ($(wc -l < "$SRT") 行)"
@@ -158,10 +179,14 @@ steps:
           --voice ${{ inputs.voice }} \
           --rate="${{ inputs.rate }}" \
           --pitch="${{ inputs.pitch }}" \
-          --file ${{ steps.setup.md_path }} \
+          --file "$CLEANED" \
           --write-media "$AUDIO" \
           --write-subtitles "$SRT"
-          echo "TTS 完成: $AUDIO"
+        if [ ! -s "$AUDIO" ]; then
+          echo "❌ TTS 失败: 音频文件为空"
+          exit 1
+        fi
+        echo "TTS 完成: $AUDIO ($(du -h "$AUDIO" | cut -f1))"
       fi
 
   # ═══════════════════════════════════════════
@@ -177,11 +202,11 @@ steps:
       echo "$DURATION"
 
   - id: read_md
-    name: "读取原文内容"
+    name: "读取清洗后文本"
     type: tool
-    depends_on: [setup]
+    depends_on: [clean_text]
     tool_name: read_file
-    tool_args: '{"path": "${{ steps.setup.md_path }}"}'
+    tool_args: '{"path": "${{ steps.setup.cleaned_path }}"}'
 
   - id: generate_prompts
     name: "AI 生成分镜头脚本"
@@ -239,7 +264,7 @@ steps:
 
       | style 参数 | 画风 |
       |-----------|------|
-      | ink_wash | 黑白水墨/素描质感，冷灰暗蓝调色，偶有刺目鲜红，民国元素与现代交织 |
+      | ink_wash | 黑白水墨/素描质感，冷灰暗蓝调色 |
       | modern | 现代扁平矢量，冷色调，几何构图，科技感 |
       | sketch | 铅笔素描质感，棕褐色调，手绘感，复古 |
 
@@ -280,7 +305,9 @@ steps:
     depends_on: [gen_images]
     run: |
       cd ${{ steps.setup.video_dir }}
-      bash ${{ steps.setup.scripts_dir }}/assemble.sh --skip-normalize
+      bash ${{ steps.setup.scripts_dir }}/assemble.sh --skip-normalize \
+        --audio=${{ steps.setup.audio_path }} \
+        --output=${{ steps.setup.video_out }}
     timeout: "15m"
 
   - id: read_srt

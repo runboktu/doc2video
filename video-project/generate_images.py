@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-月夜-赏析记 — 千问文生图批量生成脚本
+千问文生图 + 图生视频 批量生成脚本
 
-使用阿里云百炼平台 qwen-image-2.0-pro 模型，为17个分镜生成插画。
-然后将图片与音频合并为最终视频。
+模式:
+  images  — 文生图（千问 qwen-image-2.0-pro）
+  videos  — 图生视频（FFmpeg Ken Burns / AI 接口）
+  all     — 先文生图，再图生视频
 
 环境变量:
-  DASHSCOPE_API_KEY — 阿里云百炼 API Key
+  DASHSCOPE_API_KEY — 阿里云百炼 API Key（文生图需要）
 
 用法:
-  python generate_images.py              # 生成全部图片
-  python generate_images.py --shots S01 S02  # 只生成指定镜头
-  python generate_images.py --skip-existing  # 跳过已有图片
-  python generate_images.py --assemble       # 只执行合并（不生成图片）
+  python generate_images.py --mode all                  # 全流程
+  python generate_images.py --mode images               # 只生成图片
+  python generate_images.py --mode videos               # 只生成视频
+  python generate_images.py --mode videos --video-backend ai  # 用 AI 接口（暂未实现）
+  python generate_images.py --shots S01 S02             # 只处理指定镜头
+  python generate_images.py --skip-existing             # 跳过已有文件
 """
 
 import argparse
@@ -21,21 +25,35 @@ import os
 import subprocess
 import sys
 import time
-import requests
 from pathlib import Path
+
+import requests
 
 PROJECT_DIR = Path(__file__).parent
 PROMPTS_FILE = PROJECT_DIR / "prompts.json"
 IMAGES_DIR = PROJECT_DIR / "images"
-AUDIO_FILE = PROJECT_DIR.parent / "月夜-赏析.wav"
-OUTPUT_VIDEO = PROJECT_DIR / "月夜-赏析.mp4"
+CLIPS_DIR = PROJECT_DIR / "clips"
 
 IMAGES_DIR.mkdir(exist_ok=True)
+CLIPS_DIR.mkdir(exist_ok=True)
 
 API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 MODEL = "qwen-image-2.0-pro"
 IMAGE_SIZE = "1792*1024"
 
+# Ken Burns 方向参数（5 种运动模式循环）
+KB_DIRECTIONS = [
+    ("iw", "ih"),       # 右下
+    ("0", "0"),         # 左上
+    ("iw*0.15", "0"),   # 右上
+    ("0", "ih*0.15"),   # 左下
+    ("iw*0.15", "ih*0.15"),  # 右下（短距）
+]
+
+
+# ═══════════════════════════════════════════
+# 文生图
+# ═══════════════════════════════════════════
 
 def load_prompts() -> dict:
     with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
@@ -49,6 +67,7 @@ def generate_image(
     api_key: str,
     max_retries: int = 3,
 ) -> Path | None:
+    """调用千问 API 生成单张图片。"""
     print(f"  🎨 生成图片: {output_path.name}")
 
     headers = {
@@ -127,10 +146,14 @@ def generate_image(
     return output_path
 
 
-def generate_all_images(project: dict, api_key: str, skip_existing: bool = True):
+def generate_all_images(project: dict, api_key: str, skip_existing: bool = True) -> int:
+    """批量文生图。返回失败数量。"""
     style_prefix = "黑白水墨画风格插画，冷灰色调，素描质感。"
     style_suffix = " 编辑插画风格，电影感构图，16:9横版。"
     neg_common = "照片级写实, 3D渲染, 卡通, 动漫, 亮丽色彩, 鲜艳"
+
+    total = len(project["shots"])
+    failed = 0
 
     for shot in project["shots"]:
         shot_id = shot["id"]
@@ -145,212 +168,176 @@ def generate_all_images(project: dict, api_key: str, skip_existing: bool = True)
 
         result = generate_image(prompt, negative, output_path, api_key)
         if not result:
-            print(f"  ⚠️  {shot_id} 生成失败，稍后重试")
+            failed += 1
+            print(f"  ⚠️  {shot_id} 生成失败 ({failed} 失败 / {total} 总计)")
 
         time.sleep(5)
 
-    print(f"\n🎨 图片生成完成，保存在: {IMAGES_DIR}/")
+    succeeded = total - failed
+    print(f"\n🎨 图片生成完成: {succeeded}/{total} 成功，保存在: {IMAGES_DIR}/")
 
-
-def assemble_video(project: dict):
-    if not AUDIO_FILE.exists():
-        print(f"❌ 音频文件不存在: {AUDIO_FILE}")
+    if failed > 0 and succeeded == 0:
+        print(f"❌ 全部 {total} 个镜头生成失败，无法继续")
         sys.exit(1)
+    elif failed > total // 2:
+        print(f"⚠️  超过一半镜头 ({failed}/{total}) 生成失败，结果可能不理想")
+        print(f"   可用 --no-skip 重试，或检查 API 配额和网络")
 
-    total_duration = project["total_duration_sec"]
-    print(f"\n🎬 合并视频...")
-    print(f"   音频: {AUDIO_FILE}")
-    print(f"   总时长: {total_duration}s")
-    print(f"   镜头数: {len(project['shots'])}")
+    return failed
 
-    shots_data = []
-    for shot in project["shots"]:
-        img_path = IMAGES_DIR / f"{shot['id']}.png"
-        if not img_path.exists():
-            print(f"  ⚠️  缺少图片: {shot['id']}.png，跳过")
-            continue
-        shots_data.append(
-            {
-                "id": shot["id"],
-                "image": str(img_path),
-                "duration": shot["duration_sec"],
-                "timestamp": shot["timestamp"],
-            }
+
+# ═══════════════════════════════════════════
+# 图生视频
+# ═══════════════════════════════════════════
+
+def generate_video_ffmpeg(
+    image_path: Path,
+    output_path: Path,
+    duration: float,
+    direction_index: int = 0,
+) -> Path | None:
+    """用 FFmpeg zoompan 把静态图转成 Ken Burns 动效视频。"""
+    dx, dy = KB_DIRECTIONS[direction_index % len(KB_DIRECTIONS)]
+    frames = int(duration * 25)
+
+    zoom_filter = (
+        f"scale=8000:-1,"
+        f"zoompan=z='min(zoom+0.0003,1.5)':"
+        f"x='{dx}':y='{dy}':"
+        f"d={frames}:s=1792x1024:fps=25"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1",
+        "-i", str(image_path),
+        "-t", str(duration),
+        "-vf", zoom_filter,
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-r", "25",
+        str(output_path),
+    ]
+
+    print(f"  🎞️  生成视频: {output_path.name} ({duration}s, 方向={direction_index})")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,
         )
-
-    if not shots_data:
-        print("❌ 没有可用的图片")
-        sys.exit(1)
-
-    clips_dir = PROJECT_DIR / "clips"
-    clips_dir.mkdir(exist_ok=True)
-
-    clip_files = []
-    for i, shot in enumerate(shots_data):
-        clip_path = clips_dir / f"{shot['id']}.mp4"
-        clip_files.append(str(clip_path))
-
-        if clip_path.exists():
-            print(f"  ⏭️  跳过已有片段: {clip_path.name}")
-            continue
-
-        duration = shot["duration"]
-        img = shot["image"]
-        directions = [
-            ("iw", "ih", "(iw*1.15)", "(ih*1.15)"),
-            ("0", "0", "(iw*0.85)", "(ih*0.85)"),
-            ("iw*0.15", "0", "iw", "(ih*0.85)"),
-            ("0", "ih*0.15", "(iw*0.85)", "ih"),
-            ("iw*0.15", "ih*0.15", "iw", "ih"),
-        ]
-        d = directions[i % len(directions)]
-        zoom_filter = (
-            f"scale=8000:-1,"
-            f"zoompan=z='min(zoom+0.0003,1.5)':"
-            f"x='{d[0]}':y='{d[1]}':"
-            f"d={int(duration * 25)}:s=1792x1024:fps=25"
-        )
-
-    if not shots_data:
-        print("❌ 没有可用的图片")
-        sys.exit(1)
-
-    # 为每个镜头生成带 Ken Burns 效果的视频片段
-    clips_dir = PROJECT_DIR / "clips"
-    clips_dir.mkdir(exist_ok=True)
-
-    clip_files = []
-    for i, shot in enumerate(shots_data):
-        clip_path = clips_dir / f"{shot['id']}.mp4"
-        clip_files.append(str(clip_path))
-
-        if clip_path.exists():
-            print(f"  ⏭️  跳过已有片段: {clip_path.name}")
-            continue
-
-        duration = shot["duration"]
-        img = shot["image"]
-
-        # Ken Burns: 从 100% 缓慢放大到 115%，轻微平移
-        # 每个镜头用不同的运动方向
-        directions = [
-            ("iw", "ih", "(iw*1.15)", "(ih*1.15)"),  # zoom in center
-            ("0", "0", "(iw*0.85)", "(ih*0.85)"),  # zoom out from top-left
-            ("iw*0.15", "0", "iw", "(ih*0.85)"),  # zoom out from top-right
-            ("0", "ih*0.15", "(iw*0.85)", "ih"),  # zoom out from bottom-left
-            ("iw*0.15", "ih*0.15", "iw", "ih"),  # zoom out from bottom-right
-        ]
-        d = directions[i % len(directions)]
-        zoom_filter = (
-            f"scale=8000:-1,"
-            f"zoompan=z='min(zoom+0.0003,1.5)':"
-            f"x='{d[0]}':y='{d[1]}':"
-            f"d={int(duration * 25)}:s=1792x1024:fps=25"
-        )
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loop",
-            "1",
-            "-i",
-            img,
-            "-t",
-            str(duration),
-            "-vf",
-            zoom_filter,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-r",
-            "25",
-            str(clip_path),
-        ]
-        print(f"  🎞️  生成片段: {clip_path.name} ({duration}s)")
-        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"  ❌ ffmpeg 失败: {result.stderr[:200]}")
-            sys.exit(1)
-
-    concat_file = PROJECT_DIR / "concat_list.txt"
-    with open(concat_file, "w", encoding="utf-8") as f:
-        for clip in clip_files:
-            f.write(f"file '{clip}'\n")
-
-    concat_video = PROJECT_DIR / "concat_video.mp4"
-    print(f"\n🔗 拼接 {len(clip_files)} 个片段...")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_file),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "medium",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        str(concat_video),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ❌ 拼接失败: {result.stderr[:200]}")
+            print(f"  ❌ FFmpeg 失败: {result.stderr[:300]}")
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"  ❌ FFmpeg 超时 (>{300}s)")
+        return None
+    except FileNotFoundError:
+        print(f"  ❌ 找不到 ffmpeg，请先安装: brew install ffmpeg")
         sys.exit(1)
 
-    print(f"🎵 叠加音频...")
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(concat_video),
-        "-i",
-        str(AUDIO_FILE),
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-shortest",
-        str(OUTPUT_VIDEO),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ❌ 叠加音频失败: {result.stderr[:200]}")
+    size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"  ✅ 已保存: {output_path.name} ({size_mb:.1f}MB)")
+    return output_path
+
+
+def generate_video_ai(
+    image_path: Path,
+    output_path: Path,
+    duration: float,
+) -> Path | None:
+    """调用 AI 接口生成视频（空实现，待接入具体 API）。"""
+    print(f"  ⏳ AI 图生视频暂未实现: {output_path.name}")
+    print(f"     可接入 Kling / Runway / Pika 等 API")
+    return None
+
+
+def generate_all_videos(
+    project: dict,
+    backend: str = "ffmpeg",
+    skip_existing: bool = True,
+) -> int:
+    """批量图生视频。返回失败数量。"""
+    total = len(project["shots"])
+    failed = 0
+
+    for i, shot in enumerate(project["shots"]):
+        shot_id = shot["id"]
+        duration = shot.get("duration_sec", 30)
+        image_path = IMAGES_DIR / f"{shot_id}.png"
+        output_path = CLIPS_DIR / f"{shot_id}.mp4"
+
+        if not image_path.exists():
+            print(f"  ⚠️  缺少图片: {image_path.name}，跳过")
+            failed += 1
+            continue
+
+        if skip_existing and output_path.exists():
+            print(f"  ⏭️  跳过已有: {output_path.name}")
+            continue
+
+        if backend == "ai":
+            result = generate_video_ai(image_path, output_path, duration)
+        else:
+            result = generate_video_ffmpeg(image_path, output_path, duration, direction_index=i)
+
+        if not result:
+            failed += 1
+            print(f"  ⚠️  {shot_id} 视频生成失败 ({failed} 失败 / {total} 总计)")
+
+    succeeded = total - failed
+    print(f"\n🎞️  视频生成完成: {succeeded}/{total} 成功，保存在: {CLIPS_DIR}/")
+
+    if failed > 0 and succeeded == 0:
+        print(f"❌ 全部 {total} 个镜头视频生成失败")
         sys.exit(1)
 
-    concat_video.unlink(missing_ok=True)
+    return failed
 
-    size_mb = OUTPUT_VIDEO.stat().st_size / 1024 / 1024
-    print(f"\n✅ 视频生成完成！")
-    print(f"   📁 {OUTPUT_VIDEO}")
-    print(f"   📦 {size_mb:.1f}MB")
 
+# ═══════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="月夜-赏析 — 千问文生图 + 视频合并")
-    parser.add_argument(
-        "--shots", nargs="*", help="只生成指定镜头，如: --shots S01 S05"
+    parser = argparse.ArgumentParser(
+        description="千问文生图 + 图生视频",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python generate_images.py --mode all              # 全流程：图片 + 视频
+  python generate_images.py --mode images            # 只生成图片
+  python generate_images.py --mode videos            # 只生成视频（需要已有图片）
+  python generate_images.py --mode videos --video-backend ai  # AI 接口（暂未实现）
+  python generate_images.py --shots S01 S03          # 只处理指定镜头
+        """,
     )
     parser.add_argument(
-        "--skip-existing", action="store_true", default=True, help="跳过已有图片"
+        "--mode",
+        choices=["images", "videos", "all"],
+        default="all",
+        help="运行模式: images=文生图, videos=图生视频, all=先图后视 (默认: all)",
     )
     parser.add_argument(
-        "--assemble", action="store_true", help="只执行视频合并（不生成图片）"
+        "--video-backend",
+        choices=["ffmpeg", "ai"],
+        default="ffmpeg",
+        help="图生视频后端: ffmpeg=Ken Burns 动效 (默认), ai=AI 接口 (暂未实现)",
     )
     parser.add_argument(
-        "--no-skip", action="store_true", help="不跳过已有图片，强制重新生成"
+        "--shots", nargs="*", help="只处理指定镜头，如: --shots S01 S05"
+    )
+    parser.add_argument(
+        "--skip-existing", action="store_true", default=True, help="跳过已有文件 (默认开启)"
+    )
+    parser.add_argument(
+        "--no-skip", action="store_true", help="不跳过已有文件，强制重新生成"
     )
     args = parser.parse_args()
 
@@ -362,22 +349,32 @@ def main():
 
     skip_existing = args.skip_existing and not args.no_skip
 
+    mode_label = {"images": "文生图", "videos": "图生视频", "all": "全流程"}[args.mode]
     print(f"{'=' * 60}")
-    print(f"月夜-赏析 — 千问文生图")
     print(f"镜头数: {len(project['shots'])}")
-    print(f"模型: {MODEL}")
+    print(f"模式: {mode_label}")
+    if args.mode in ("videos", "all"):
+        print(f"视频后端: {args.video_backend}")
     print(f"{'=' * 60}\n")
 
-    if not args.assemble:
+    # ── 文生图 ──
+    if args.mode in ("images", "all"):
         api_key = os.environ.get("DASHSCOPE_API_KEY", "")
         if not api_key:
             print("⚠️  未设置 DASHSCOPE_API_KEY 环境变量")
             print("   export DASHSCOPE_API_KEY='sk-xxx'")
             print("   获取: https://bailian.console.aliyun.com/")
             sys.exit(1)
+
+        print(f"🎨 文生图 (模型: {MODEL})\n")
         generate_all_images(project, api_key, skip_existing)
 
-    assemble_video(project)
+    # ── 图生视频 ──
+    if args.mode in ("videos", "all"):
+        print(f"\n🎞️  图生视频 (后端: {args.video_backend})\n")
+        generate_all_videos(project, backend=args.video_backend, skip_existing=skip_existing)
+
+    print(f"\n✅ 全部完成")
 
 
 if __name__ == "__main__":
