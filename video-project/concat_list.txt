@@ -1,8 +1,0 @@
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S01.mp4'
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S02.mp4'
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S03.mp4'
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S04.mp4'
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S05.mp4'
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S06.mp4'
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S07.mp4'
-file '/Users/mingshu/workspace/code/ai/cli/doc2video/video-project/clips/S08.mp4'

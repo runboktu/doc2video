@@ -9,8 +9,8 @@
 #                          │                                                                                      │
 #                          └──→ read_md ────────────────────────────┘────────────────────────────────────────┘
 #                                                                                                             │
-#                                                                 burn_subs ←────────────────────────────────┘
-#
+  #                                                                 burn_subs ──→ pack
+  #
 # 并行分支：
 #   - get_duration / proofread_srt 可并行（都依赖 tts）
 #   - gen_images 与 proofread_srt 可并行（互不依赖）
@@ -245,7 +245,7 @@ steps:
       ## 输出格式（严格遵守）
       最终输出以下格式：
       final_answer xml标签包裹如下json
-      {"project":"...","total_duration_sec":...,"style_guide":"...","default_params":{"model_id":"qwen","resolution":"1080p","duration":5,"fps":24,"aspect_ratio":"16:9"},"shots":[{"id":"S01","timestamp":"0:00 - 0:30","duration_sec":30,"clips_needed":3,"prompt":"English visual description","negative_prompt":"elements to exclude"}]}
+      {"project":"...","total_duration_sec":...,"style_guide":"...","default_params":{"model_id":"qwen","resolution":"1080p","duration":5,"fps":24,"aspect_ratio":"16:9"},"shots":[{"id":"S01","timestamp":"0:00 - 0:30","duration_sec":30,"clips_needed":3,"prompt":"Chinese visual description","negative_prompt":"elements to exclude"}]}
 
       ## 分镜规则
 
@@ -264,8 +264,8 @@ steps:
 
       | style 参数 | 画风 |
       |-----------|------|
-      | ink_wash | 黑白水墨/素描质感，冷灰暗蓝调色 |
-      | modern | 现代扁平矢量，冷色调，几何构图，科技感 |
+      | ink_wash | 美式漫画/波普风格，粗黑线描，高饱和撞色，网点阴影，夸张透视，带幽默感 |
+      | modern | 美式漫画/波普风格，粗黑线描，高饱和撞色，网点阴影，夸张透视，带幽默感 |
       | sketch | 铅笔素描质感，棕褐色调，手绘感，复古 |
 
     agent_max_iterations: 10
@@ -367,6 +367,17 @@ steps:
         "output_path": "${{ steps.setup.final_out }}",
         "scripts_dir": "${{ steps.setup.scripts_dir }}"
       }
+
+  # ═══════════════════════════════════════════
+  # Phase 7: 收尾打包
+  # ═══════════════════════════════════════════
+
+  - id: pack
+    name: "收尾打包"
+    type: shell
+    depends_on: [burn_subs]
+    run: |
+      bash ${{ steps.setup.work_dir }}/pack.sh ${{ steps.setup.md_path }}
 
 outputs:
   video_file: "${{ steps.setup.video_out }}"
