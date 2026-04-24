@@ -27,7 +27,8 @@ import sys
 import time
 from pathlib import Path
 
-import requests
+import http.client
+import urllib.parse
 
 PROJECT_DIR = Path(__file__).parent
 PROMPTS_FILE = PROJECT_DIR / "prompts.json"
@@ -58,6 +59,46 @@ KB_DIRECTIONS = [
 def load_prompts() -> dict:
     with open(PROMPTS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _http_post_json(url: str, payload: dict, headers: dict, timeout: int = 120) -> tuple[int, dict]:
+    """用 http.client 发送 POST JSON，返回 (status_code, json_dict)。"""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    path = parsed.path or "/"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    conn = http.client.HTTPSConnection(host, timeout=timeout)
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = json.loads(resp.read().decode("utf-8"))
+        return resp.status, data
+    finally:
+        conn.close()
+
+
+def _http_download(url: str, timeout: int = 60) -> bytes | None:
+    """用 http.client 下载文件内容。"""
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+
+    conn = http.client.HTTPSConnection(host, timeout=timeout)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        if resp.status != 200:
+            print(f"  ❌ 下载 HTTP {resp.status}")
+            return None
+        return resp.read()
+    except Exception as e:
+        print(f"  ❌ 下载失败: {e}")
+        return None
+    finally:
+        conn.close()
 
 
 def generate_image(
@@ -96,26 +137,24 @@ def generate_image(
 
     for attempt in range(max_retries):
         try:
-            resp = requests.post(API_URL, json=payload, headers=headers, timeout=120)
-        except requests.exceptions.RequestException as e:
+            status_code, data = _http_post_json(API_URL, payload, headers, timeout=120)
+        except Exception as e:
             print(f"  ❌ 网络错误: {e}")
             return None
 
-        if resp.status_code == 429:
+        if status_code == 429:
             wait = 15 * (attempt + 1)
             print(f"  ⏳ 限流，等待 {wait}s 后重试 ({attempt + 1}/{max_retries})...")
             time.sleep(wait)
             continue
 
-        if resp.status_code != 200:
-            print(f"  ❌ API 错误 (HTTP {resp.status_code}): {resp.text[:300]}")
+        if status_code != 200:
+            print(f"  ❌ API 错误 (HTTP {status_code}): {json.dumps(data, ensure_ascii=False)[:300]}")
             return None
         break
     else:
         print(f"  ❌ 重试 {max_retries} 次后仍被限流")
         return None
-
-    data = resp.json()
 
     image_url = None
     choices = data.get("output", {}).get("choices", [])
@@ -130,16 +169,13 @@ def generate_image(
         print(f"  ❌ 无法提取图片 URL: {json.dumps(data, ensure_ascii=False)[:300]}")
         return None
 
-    try:
-        img_resp = requests.get(image_url, timeout=60)
-        img_resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        print(f"  ❌ 下载失败: {e}")
+    img_bytes = _http_download(image_url)
+    if not img_bytes:
         return None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "wb") as f:
-        f.write(img_resp.content)
+        f.write(img_bytes)
 
     size_kb = output_path.stat().st_size / 1024
     print(f"  ✅ 已保存: {output_path.name} ({size_kb:.0f}KB)")
