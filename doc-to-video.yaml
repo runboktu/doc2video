@@ -77,6 +77,12 @@ inputs:
     required: true
     description: "阿里云百炼 API Key（千问生图）"
 
+  - name: image_model
+    type: string
+    required: false
+    default: "qwen-image-2.0-pro"
+    description: "文生图模型: qwen-image-2.0-pro, wanx2.0-t2i-turbo, wan2.2-t2i-flash 等"
+
 config:
   timeout: "60m"
   on_failure: pause
@@ -245,8 +251,8 @@ steps:
       ## 输出格式（严格遵守）
       最终输出以下格式：
       final_answer xml标签包裹如下json
-      {"project":"...","total_duration_sec":...,"style_guide":"...","default_params":{"model_id":"qwen","resolution":"1080p","duration":5,"fps":24,"aspect_ratio":"16:9"},"shots":[{"id":"S01","timestamp":"0:00 - 0:30","duration_sec":30,"clips_needed":3,"prompt":"Chinese visual description","negative_prompt":"elements to exclude"}]}
-
+      {"project":"...","video_title": "","video_summary": "","total_duration_sec":...,"style_guide":"...","default_params":{"model_id":"qwen","resolution":"1080p","duration":5,"fps":24,"aspect_ratio":"16:9"},"shots":[{"id":"S01","timestamp":"0:00 - 0:30","duration_sec":30,"clips_needed":3,"prompt":"Chinese visual description","negative_prompt":"elements to exclude"}]}
+      图片+音频合成的视频，后续发表到视频平台，video_title用于视频标题，video_summary用于视频简介
       ## 分镜规则
 
       1. 以 SRT 的文本段落和时间戳为基础，合并语义相近的连续字幕为一个镜头
@@ -264,7 +270,7 @@ steps:
 
       | style 参数 | 画风 |
       |-----------|------|
-      | ink_wash | 中国水墨山水风格，略加道家意象点缀，水墨的浓淡干湿、虚实留白，最能表现“大道至简”与“空灵玄妙”的意境 |
+      | ink_wash | 扁平矢量插画，极简风格，大胆和谐的色彩（以海军蓝为主色，橙色为强调色），干净的轮廓线，等距视角，无阴影，成人故事书风格，宽高比 16:9 |
       | modern | 美式漫画/波普风格，粗黑线描，高饱和撞色，网点阴影，夸张透视，带幽默感 |
       | sketch | 铅笔素描质感，棕褐色调，手绘感，复古 |
 
@@ -292,7 +298,7 @@ steps:
     run: |
       cd ${{ steps.setup.video_dir }}
       DASHSCOPE_API_KEY=${{ inputs.dashscope_api_key }} \
-      python3 ${{ steps.setup.scripts_dir }}/generate_images.py --skip-existing
+      python3 ${{ steps.setup.scripts_dir }}/generate_images.py --skip-existing --image-model ${{ inputs.image_model }}
     timeout: "30m"
 
   # ═══════════════════════════════════════════

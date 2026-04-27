@@ -38,8 +38,28 @@ CLIPS_DIR = PROJECT_DIR / "clips"
 IMAGES_DIR.mkdir(exist_ok=True)
 CLIPS_DIR.mkdir(exist_ok=True)
 
-API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
-MODEL = "qwen-image-2.0-pro"
+# ── 新协议 (wan2.6 / qwen-image-2.0-pro) ──
+API_URL_V2 = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+
+# ── 旧协议 (wanx2.0 / wan2.1 / wan2.2 / wan2.5) ──
+API_URL_V1 = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis"
+API_TASK_URL = "https://dashscope.aliyuncs.com/api/v1/tasks"
+
+# ── 模型配置表 ──
+MODEL_CONFIGS = {
+    # 新协议 (同步)
+    "qwen-image-2.0-pro": {"protocol": "v2", "default_size": "1792*1024"},
+    "wan2.6-t2i":         {"protocol": "v2", "default_size": "1280*1280"},
+    # 旧协议 (异步轮询)
+    "wanx2.0-t2i-turbo":  {"protocol": "v1", "default_size": "1024*1024"},
+    "wanx2.1-t2i-turbo":  {"protocol": "v1", "default_size": "1024*1024"},
+    "wanx2.1-t2i-plus":   {"protocol": "v1", "default_size": "1024*1024"},
+    "wan2.2-t2i-flash":   {"protocol": "v1", "default_size": "1024*1024"},
+    "wan2.2-t2i-plus":    {"protocol": "v1", "default_size": "1024*1024"},
+    "wan2.5-t2i-preview": {"protocol": "v1", "default_size": "1280*1280"},
+}
+
+DEFAULT_MODEL = "qwen-image-2.0-pro"
 IMAGE_SIZE = "1792*1024"
 
 # Ken Burns 方向参数（5 种运动模式循环）
@@ -116,7 +136,7 @@ def generate_image(
         "Content-Type": "application/json",
     }
     payload = {
-        "model": MODEL,
+        "model": DEFAULT_MODEL,
         "input": {
             "messages": [
                 {
@@ -137,7 +157,7 @@ def generate_image(
 
     for attempt in range(max_retries):
         try:
-            status_code, data = _http_post_json(API_URL, payload, headers, timeout=120)
+            status_code, data = _http_post_json(API_URL_V2, payload, headers, timeout=120)
         except Exception as e:
             print(f"  ❌ 网络错误: {e}")
             return None
@@ -182,7 +202,116 @@ def generate_image(
     return output_path
 
 
-def generate_all_images(project: dict, api_key: str, skip_existing: bool = True) -> int:
+def generate_image_v1(
+    prompt: str,
+    negative_prompt: str,
+    output_path: Path,
+    api_key: str,
+    model: str = "wanx2.0-t2i-turbo",
+    image_size: str = "1024*1024",
+    max_retries: int = 3,
+) -> Path | None:
+    """旧协议异步文生图 (wanx2.0 / wan2.1 / wan2.2 / wan2.5)"""
+    print(f"  🎨 生成图片 (async): {output_path.name} [模型: {model}]")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-DashScope-Async": "enable",
+    }
+    payload = {
+        "model": model,
+        "input": {
+            "prompt": prompt,
+        },
+        "parameters": {
+            "size": image_size,
+            "n": 1,
+            "prompt_extend": True,
+            "watermark": False,
+        },
+    }
+    if negative_prompt:
+        payload["input"]["negative_prompt"] = negative_prompt
+
+    for attempt in range(max_retries):
+        try:
+            status_code, data = _http_post_json(API_URL_V1, payload, headers, timeout=120)
+        except Exception as e:
+            print(f"  ❌ 网络错误: {e}")
+            return None
+
+        if status_code == 429:
+            wait = 15 * (attempt + 1)
+            print(f"  ⏳ 限流，等待 {wait}s 后重试 ({attempt + 1}/{max_retries})...")
+            time.sleep(wait)
+            continue
+
+        if status_code != 200:
+            print(f"  ❌ API 错误 (HTTP {status_code}): {json.dumps(data, ensure_ascii=False)[:300]}")
+            return None
+        break
+    else:
+        print(f"  ❌ 重试 {max_retries} 次后仍被限流")
+        return None
+
+    task_id = data.get("output", {}).get("task_id")
+    if not task_id:
+        print(f"  ❌ 无法获取 task_id: {json.dumps(data, ensure_ascii=False)[:300]}")
+        return None
+
+    print(f"  ⏳ 任务已提交: {task_id}，轮询中...")
+
+    for poll in range(60):
+        time.sleep(5)
+        try:
+            parsed = urllib.parse.urlparse(API_TASK_URL)
+            conn = http.client.HTTPSConnection(parsed.hostname, timeout=30)
+            conn.request("GET", f"{parsed.path}/{task_id}", headers={
+                "Authorization": f"Bearer {api_key}",
+            })
+            resp = conn.getresponse()
+            result = json.loads(resp.read().decode("utf-8"))
+            conn.close()
+        except Exception as e:
+            print(f"  ⚠️ 轮询错误: {e}")
+            continue
+
+        task_status = result.get("output", {}).get("task_status", "UNKNOWN")
+
+        if task_status == "SUCCEEDED":
+            results = result.get("output", {}).get("results", [])
+            if not results or not results[0].get("url"):
+                print(f"  ❌ 成功但无图片 URL")
+                return None
+            image_url = results[0]["url"]
+            break
+        elif task_status == "FAILED":
+            code = result.get("output", {}).get("code", "Unknown")
+            message = result.get("output", {}).get("message", "")
+            print(f"  ❌ 任务失败: {code} - {message}")
+            return None
+        elif poll % 6 == 0:
+            print(f"  ⏳ 状态: {task_status} ({poll * 5}s)")
+    else:
+        print(f"  ❌ 轮询超时 (>{60 * 5}s)")
+        return None
+
+    img_bytes = _http_download(image_url)
+    if not img_bytes:
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        f.write(img_bytes)
+
+    size_kb = output_path.stat().st_size / 1024
+    print(f"  ✅ 已保存: {output_path.name} ({size_kb:.0f}KB)")
+    return output_path
+
+
+def generate_all_images(project: dict, api_key: str, skip_existing: bool = True,
+                        model: str = DEFAULT_MODEL) -> int:
     """批量文生图。返回失败数量。"""
     style_prefix = "黑白水墨画风格插画，冷灰色调，素描质感。"
     style_suffix = " 编辑插画风格，电影感构图，16:9横版。"
@@ -190,6 +319,10 @@ def generate_all_images(project: dict, api_key: str, skip_existing: bool = True)
 
     total = len(project["shots"])
     failed = 0
+
+    model_cfg = MODEL_CONFIGS.get(model, MODEL_CONFIGS[DEFAULT_MODEL])
+    image_size = IMAGE_SIZE if model == DEFAULT_MODEL else model_cfg["default_size"]
+    protocol = model_cfg["protocol"]
 
     for shot in project["shots"]:
         shot_id = shot["id"]
@@ -202,7 +335,11 @@ def generate_all_images(project: dict, api_key: str, skip_existing: bool = True)
         prompt = style_prefix + shot["prompt"] + style_suffix
         negative = f"{neg_common}, {shot.get('negative_prompt', '')}"
 
-        result = generate_image(prompt, negative, output_path, api_key)
+        if protocol == "v2":
+            result = generate_image(prompt, negative, output_path, api_key)
+        else:
+            result = generate_image_v1(prompt, negative, output_path, api_key,
+                                       model=model, image_size=image_size)
         if not result:
             failed += 1
             print(f"  ⚠️  {shot_id} 生成失败 ({failed} 失败 / {total} 总计)")
@@ -361,6 +498,12 @@ def main():
         help="运行模式: images=文生图, videos=图生视频, all=先图后视 (默认: all)",
     )
     parser.add_argument(
+        "--image-model",
+        choices=list(MODEL_CONFIGS.keys()),
+        default=DEFAULT_MODEL,
+        help=f"文生图模型 (默认: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
         "--video-backend",
         choices=["ffmpeg", "ai"],
         default="ffmpeg",
@@ -378,16 +521,22 @@ def main():
     args = parser.parse_args()
 
     project = load_prompts()
+    shots = project.get("shots", [])
+
+    if not shots:
+        print(f"❌ prompts.json 中无镜头数据，请先运行 workflow 生成分镜头脚本")
+        sys.exit(1)
 
     if args.shots:
-        project["shots"] = [s for s in project["shots"] if s["id"] in args.shots]
+        shots = [s for s in shots if s["id"] in args.shots]
         print(f"🎯 指定镜头: {args.shots}")
+    project["shots"] = shots
 
     skip_existing = args.skip_existing and not args.no_skip
 
     mode_label = {"images": "文生图", "videos": "图生视频", "all": "全流程"}[args.mode]
     print(f"{'=' * 60}")
-    print(f"镜头数: {len(project['shots'])}")
+    print(f"镜头数: {len(shots)}")
     print(f"模式: {mode_label}")
     if args.mode in ("videos", "all"):
         print(f"视频后端: {args.video_backend}")
@@ -402,8 +551,8 @@ def main():
             print("   获取: https://bailian.console.aliyun.com/")
             sys.exit(1)
 
-        print(f"🎨 文生图 (模型: {MODEL})\n")
-        generate_all_images(project, api_key, skip_existing)
+        print(f"🎨 文生图 (模型: {args.image_model})\n")
+        generate_all_images(project, api_key, skip_existing, model=args.image_model)
 
     # ── 图生视频 ──
     if args.mode in ("videos", "all"):
